@@ -1,14 +1,19 @@
 # app.py
 # Python >= 3.14
 #
-# Приложение Streamlit для сравнения двух спецификаций Excel.
-# Формат результата: XLSX или JSON.
+# Сравнение двух спецификаций Excel.
+# Минимальный интерфейс:
+# - загрузка r0;
+# - загрузка r1;
+# - кнопка "Сравнить";
+# - метрики;
+# - кнопка скачивания XLSX.
 
 import io
-import json
 import re
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+import unicodedata
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -18,15 +23,44 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-DEFAULT_HEADER_ROW = 2
+HEADER_SEARCH_LIMIT = 30
+
 PLACEHOLDER_RE = re.compile(r"^\d+[.)]?$")
+
+# Визуально похожие кириллические и латинские буквы.
+# Используется только для нормализации ключей сравнения.
+HOMOGLYPH_MAP = {
+    "А": "A",
+    "а": "a",
+    "В": "B",
+    "в": "b",
+    "Е": "E",
+    "е": "e",
+    "К": "K",
+    "к": "k",
+    "М": "M",
+    "м": "m",
+    "Н": "H",
+    "н": "h",
+    "О": "O",
+    "о": "o",
+    "Р": "P",
+    "р": "p",
+    "С": "C",
+    "с": "c",
+    "Т": "T",
+    "т": "t",
+    "Х": "X",
+    "х": "x",
+    "У": "Y",
+    "у": "y",
+}
+
+HOMOGLYPH_TRANSLATE = {ord(k): v for k, v in HOMOGLYPH_MAP.items()}
 
 
 @dataclass(slots=True)
 class FieldChange:
-    """
-    Изменение одного поля/столбца в строке.
-    """
     field: str
     old: str
     new: str
@@ -34,9 +68,6 @@ class FieldChange:
 
 @dataclass(slots=True)
 class RowRecord:
-    """
-    Нормализованная строка спецификации.
-    """
     excel_row: int
     section: str
     is_section: bool
@@ -46,9 +77,6 @@ class RowRecord:
 
 @dataclass(slots=True)
 class ParsedSpec:
-    """
-    Разобранный файл спецификации.
-    """
     file_name: str
     title: str
     columns: list[str]
@@ -57,9 +85,6 @@ class ParsedSpec:
 
 @dataclass(slots=True)
 class RowChange:
-    """
-    Результат сравнения одной строки.
-    """
     key: str
     section: str
     old_row_num: int | None = None
@@ -71,9 +96,6 @@ class RowChange:
 
 @dataclass(slots=True)
 class ComparisonResult:
-    """
-    Полный результат сравнения двух спецификаций.
-    """
     meta: dict[str, Any]
     summary: dict[str, int]
     columns: list[str]
@@ -85,11 +107,7 @@ class ComparisonResult:
 
 def normalize_text(value: Any) -> str:
     """
-    Нормализует значение ячейки к строке:
-    - None/NaN -> пустая строка;
-    - числа 2.0 -> 2;
-    - лишние пробелы убираются;
-    - одиночные тире/прочерки считаются пустым значением.
+    Нормализует значение ячейки для отображения и сравнения.
     """
     if value is None:
         return ""
@@ -112,27 +130,46 @@ def normalize_text(value: Any) -> str:
             pass
         return str(value)
 
-    s = str(value).replace("\xa0", " ")
+    s = str(value)
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\xa0", " ")
     s = re.sub(r"\s+", " ", s).strip()
 
+    # Одиночные прочерки считаем пустым значением.
     if s in {"-", "—", "–", "--", "---"}:
         return ""
 
     return s
 
 
+def normalize_for_key(value: Any) -> str:
+    """
+    Нормализует значение для построения ключа сравнения.
+    """
+    s = normalize_text(value)
+    if not s:
+        return ""
+
+    s = s.translate(HOMOGLYPH_TRANSLATE)
+
+    s = (
+        s.replace('"', "")
+        .replace("«", "")
+        .replace("»", "")
+        .replace("'", "")
+        .replace("’", "")
+    )
+
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+
 def clean_header(value: Any, idx: int) -> str:
-    """
-    Нормализует заголовок столбца.
-    """
     result = normalize_text(value)
     return result if result else f"Столбец {idx + 1}"
 
 
 def make_unique_columns(columns: list[str]) -> list[str]:
-    """
-    Делает имена столбцов уникальными, если есть дубли.
-    """
     seen: dict[str, int] = {}
     result: list[str] = []
 
@@ -148,9 +185,6 @@ def make_unique_columns(columns: list[str]) -> list[str]:
 
 
 def find_column(columns: list[str], keywords: tuple[str, ...]) -> str | None:
-    """
-    Ищет столбец по ключевым словам в имени столбца.
-    """
     for keyword in keywords:
         for col in columns:
             if keyword in col.lower():
@@ -159,9 +193,6 @@ def find_column(columns: list[str], keywords: tuple[str, ...]) -> str | None:
 
 
 def build_field_map(columns: list[str]) -> dict[str, str | None]:
-    """
-    Определяет служебные столбцы спецификации по их названиям.
-    """
     return {
         "poz": find_column(columns, ("поз. по спецификации", "поз")),
         "name": find_column(columns, ("наименование",)),
@@ -186,109 +217,199 @@ def read_title(file_bytes: bytes) -> str:
     return normalize_text(title)
 
 
-def parse_spec(
-    file_bytes: bytes,
-    file_name: str,
-    header_row: int,
-    ignore_placeholders: bool = True,
-) -> ParsedSpec:
+def find_header_index(df_raw: pd.DataFrame) -> int:
     """
-    Разбирает файл спецификации.
+    Автоматически ищет строку заголовков основной таблицы.
+    """
+    limit = min(len(df_raw), HEADER_SEARCH_LIMIT)
 
-    Логика:
-    - заголовок таблицы берётся из строки header_row;
-    - данные идут ниже;
-    - строка считается разделом, если заполнен только столбец
-      "Наименование и техническая характеристика";
-    - для строк создаётся ключ сравнения.
-    """
+    # Основной вариант: есть слова "Поз" и "Наименование".
+    for i in range(limit):
+        row = df_raw.iloc[i]
+        texts = [normalize_text(v).lower() for v in row]
+        joined = " | ".join(texts)
+
+        if "поз" in joined and "наименование" in joined:
+            return i
+
+    # Резервный вариант: первая строка с достаточным количеством непустых ячеек.
+    for i in range(limit):
+        row = df_raw.iloc[i]
+        non_empty = sum(1 for v in row if normalize_text(v))
+        if non_empty >= 3:
+            return i
+
+    return 1 if len(df_raw) > 1 else 0
+
+
+def parse_spec(file_bytes: bytes, file_name: str) -> ParsedSpec:
     title = read_title(file_bytes)
 
-    df = pd.read_excel(
+    df_raw = pd.read_excel(
         io.BytesIO(file_bytes),
-        header=header_row - 1,
+        header=None,
         dtype=object,
         engine="openpyxl",
+        sheet_name=0,
     )
 
+    if df_raw.empty:
+        return ParsedSpec(
+            file_name=file_name,
+            title=title,
+            columns=[],
+            records=[],
+        )
+
+    header_idx = find_header_index(df_raw)
+    header_excel_row = header_idx + 1
+
+    header_values = df_raw.iloc[header_idx]
+
+    if len(header_values) == 0:
+        return ParsedSpec(
+            file_name=file_name,
+            title=title,
+            columns=[],
+            records=[],
+        )
+
+    # Определяем последний столбец, у которого есть текст заголовка.
+    last_header_col = -1
+    for i, v in enumerate(header_values):
+        if normalize_text(v):
+            last_header_col = i
+
+    if last_header_col < 0:
+        last_header_col = len(header_values) - 1
+
+    raw_headers = header_values.iloc[: last_header_col + 1].tolist()
     columns = make_unique_columns(
-        [clean_header(col, i) for i, col in enumerate(df.columns)]
+        [clean_header(v, i) for i, v in enumerate(raw_headers)]
     )
-    df.columns = columns
 
     field_map = build_field_map(columns)
 
-    name_col = field_map["name"]
-    poz_col = field_map["poz"]
+    poz_col = field_map["poz"] or (columns[0] if columns else None)
+    name_col = field_map["name"] or (columns[1] if len(columns) > 1 else None)
+    type_col = field_map["type"]
+    code_col = field_map["code"]
+    factory_col = field_map["factory"]
+    unit_col = field_map["unit"]
     qty_col = field_map["qty"]
     mass_col = field_map["mass"]
     note_col = field_map["note"]
 
-    volatile_cols = {col for col in (qty_col, mass_col, note_col) if col}
+    volatile_cols = {c for c in (qty_col, mass_col, note_col) if c}
+
+    data = df_raw.iloc[header_idx + 1 :, : last_header_col + 1].reset_index(drop=True)
 
     records: list[RowRecord] = []
 
     current_section = ""
+    current_section_key = ""
+
     section_counts: dict[str, int] = {}
     key_counts: dict[str, int] = {}
 
-    for offset, (_, row) in enumerate(df.iterrows()):
-        excel_row = header_row + offset + 1
+    for offset, row in data.iterrows():
+        excel_row = header_excel_row + offset + 1
 
-        values = {col: normalize_text(row.get(col)) for col in columns}
+        values: dict[str, str] = {}
+
+        for i, col in enumerate(columns):
+            values[col] = normalize_text(row[i]) if i < len(row) else ""
+
         non_empty = [col for col, val in values.items() if val]
 
         # Полностью пустая строка.
         if not non_empty:
             continue
 
-        # Служебные пустые строки вида "4." или "5.".
-        if (
-            ignore_placeholders
-            and name_col
-            and len(non_empty) == 1
-            and non_empty[0] == name_col
-            and PLACEHOLDER_RE.fullmatch(values[name_col])
-        ):
-            continue
+        # Служебные строки вида "4." или "5.".
+        if len(non_empty) == 1:
+            only_value = values[non_empty[0]]
+            if PLACEHOLDER_RE.fullmatch(only_value):
+                continue
 
         # Если заполнен только столбец "Наименование...", считаем строку разделом.
         is_section = bool(name_col) and len(non_empty) == 1 and non_empty[0] == name_col
 
         if is_section:
             section_name = values[name_col]
-            count = section_counts.get(section_name, 0) + 1
-            section_counts[section_name] = count
+            section_key = normalize_for_key(section_name)
+
+            # Если встретился блок типа "ГОСТы" после основной спецификации,
+            # не обрабатываем его как данные спецификации.
+            if section_key == "госты":
+                break
+
+            count = section_counts.get(section_key, 0) + 1
+            section_counts[section_key] = count
 
             current_section = (
                 section_name if count == 1 else f"{section_name} ({count})"
             )
-            key = f"section::{current_section}"
+            current_section_key = (
+                section_key if count == 1 else f"{section_key}#{count}"
+            )
+
+            key = f"section::{current_section_key}"
+
         else:
             poz = values.get(poz_col, "") if poz_col else ""
 
-            # Если есть позиция, используем её как основной ключ.
-            if poz:
-                base_key = f"poz::{current_section}::{poz}"
-            else:
-                # Иначе используем все поля, кроме обычно изменяемых количественных/служебных.
-                identity_parts: list[str] = []
+            name_val = values.get(name_col, "") if name_col else ""
+            unit_val = values.get(unit_col, "") if unit_col else ""
+            qty_val = values.get(qty_col, "") if qty_col else ""
 
-                for col in columns:
+            # Признаки изделия.
+            # В реальных файлах единица измерения может быть не заполнена,
+            # поэтому достаточно наименования и количества/единицы.
+            is_item = bool(name_val and (unit_val or qty_val))
+
+            if is_item:
+                # Ключ изделия:
+                # Наименование | Тип | Код | Завод | Ед. изм.
+                item_parts: list[str] = []
+
+                for col in (name_col, type_col, code_col, factory_col, unit_col):
+                    if col:
+                        item_parts.append(normalize_for_key(values.get(col, "")))
+
+                # Контекст раздела добавляется, чтобы различать одинаковые изделия
+                # в разных разделах спецификации.
+                base_key = (
+                    f"item::{current_section_key or 'no_section'}::"
+                    + "|".join(item_parts)
+                )
+
+            elif poz:
+                # Строки без признаков изделия, но с позицией,
+                # сопоставляем по нормализованной позиции.
+                base_key = f"poz::{normalize_for_key(poz)}"
+
+            else:
+                # Резервный вариант для строк без позиции и без признаков изделия.
+                fallback_parts: list[str] = []
+
+                for col, val in values.items():
                     if col in volatile_cols:
                         continue
 
-                    val = values.get(col, "")
                     if val:
-                        identity_parts.append(f"{col}={val}")
+                        fallback_parts.append(
+                            f"{normalize_for_key(col)}={normalize_for_key(val)}"
+                        )
 
-                if identity_parts:
-                    base_key = f"row::{current_section}::" + "|".join(identity_parts)
+                if fallback_parts:
+                    base_key = "row::" + "|".join(fallback_parts)
                 else:
-                    base_key = f"empty::{current_section}::{offset}"
+                    base_key = f"empty::{offset}"
 
             count = key_counts.get(base_key, 0) + 1
             key_counts[base_key] = count
+
             key = base_key if count == 1 else f"{base_key}#{count}"
 
         records.append(
@@ -309,14 +430,7 @@ def parse_spec(
     )
 
 
-def compare_specs(
-    old: ParsedSpec,
-    new: ParsedSpec,
-    header_row: int,
-) -> ComparisonResult:
-    """
-    Сравнивает две спецификации по ключам строк.
-    """
+def compare_specs(old: ParsedSpec, new: ParsedSpec) -> ComparisonResult:
     columns = list(dict.fromkeys(old.columns + new.columns))
     field_map = build_field_map(columns)
 
@@ -401,8 +515,7 @@ def compare_specs(
     }
 
     meta = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "header_row": header_row,
+        "generated_at": datetime.now().isoformat(),
         "old_file": old.file_name,
         "new_file": new.file_name,
         "old_title": old.title,
@@ -422,9 +535,6 @@ def compare_specs(
 
 
 def changed_fields_to_df(result: ComparisonResult) -> pd.DataFrame:
-    """
-    Возвращает DataFrame с изменениями по каждому изменённому полю.
-    """
     headers = [
         "Статус",
         "Раздел",
@@ -468,9 +578,6 @@ def items_to_df(
     columns: list[str],
     mode: str,
 ) -> pd.DataFrame:
-    """
-    Возвращает DataFrame для добавленных или удалённых строк.
-    """
     headers = ["Раздел", "Excel row", *columns]
     rows: list[dict[str, Any]] = []
 
@@ -494,9 +601,6 @@ def items_to_df(
 
 
 def to_cell(value: Any) -> Any:
-    """
-    Подготавливает значение для записи в Excel.
-    """
     if value is None:
         return ""
 
@@ -510,9 +614,6 @@ def to_cell(value: Any) -> Any:
 
 
 def df_to_rows(df: pd.DataFrame) -> list[list[Any]]:
-    """
-    Преобразует DataFrame в список строк для записи в Excel.
-    """
     if df.empty:
         return []
 
@@ -520,9 +621,6 @@ def df_to_rows(df: pd.DataFrame) -> list[list[Any]]:
 
 
 def export_xlsx(result: ComparisonResult) -> bytes:
-    """
-    Формирует итоговый XLSX-файл сравнения.
-    """
     wb = Workbook()
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
@@ -555,7 +653,6 @@ def export_xlsx(result: ComparisonResult) -> bytes:
         else:
             ws.append(["Нет данных"])
 
-        # Примерная автоподборка ширины столбцов.
         for col_idx, header in enumerate(headers, start=1):
             max_len = len(str(header))
             max_row = min(ws.max_row, 100)
@@ -580,7 +677,6 @@ def export_xlsx(result: ComparisonResult) -> bytes:
 
         ws.freeze_panes = "A2"
 
-    # Лист "Итог"
     ws_summary = wb.active
     ws_summary.title = "Итог"
 
@@ -589,8 +685,7 @@ def export_xlsx(result: ComparisonResult) -> bytes:
         ["Файл после корректировки", result.meta.get("new_file", "")],
         ["Название в r0", result.meta.get("old_title", "")],
         ["Название в r1", result.meta.get("new_title", "")],
-        ["Строка заголовков", result.meta.get("header_row", "")],
-        ["Дата сравнения (UTC)", result.meta.get("generated_at", "")],
+        ["Дата сравнения", result.meta.get("generated_at", "")],
         ["Состав столбцов одинаковый", result.meta.get("headers_equal", "")],
         ["Добавлено строк", result.summary.get("added", 0)],
         ["Удалено строк", result.summary.get("deleted", 0)],
@@ -602,7 +697,6 @@ def export_xlsx(result: ComparisonResult) -> bytes:
 
     write_table(ws_summary, ["Параметр", "Значение"], summary_rows)
 
-    # Лист "Изменения"
     changes_df = changed_fields_to_df(result)
     write_table(
         wb.create_sheet("Изменения"),
@@ -611,7 +705,6 @@ def export_xlsx(result: ComparisonResult) -> bytes:
         modified_fill,
     )
 
-    # Лист "Добавленные"
     added_df = items_to_df(result.added, result.columns, "added")
     write_table(
         wb.create_sheet("Добавленные"),
@@ -620,7 +713,6 @@ def export_xlsx(result: ComparisonResult) -> bytes:
         added_fill,
     )
 
-    # Лист "Удалённые"
     deleted_df = items_to_df(result.deleted, result.columns, "deleted")
     write_table(
         wb.create_sheet("Удалённые"),
@@ -634,14 +726,6 @@ def export_xlsx(result: ComparisonResult) -> bytes:
     return bio.getvalue()
 
 
-def export_json(result: ComparisonResult) -> bytes:
-    """
-    Формирует JSON-результат сравнения.
-    """
-    payload = asdict(result)
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-
-
 def main() -> None:
     st.set_page_config(
         page_title="Сравнение спецификаций",
@@ -649,139 +733,55 @@ def main() -> None:
     )
 
     st.title("Сравнение спецификаций")
-    st.caption(
-        "Загрузите два файла Excel: r0 — до корректировки и r1 — после корректировки."
-    )
 
-    with st.sidebar:
-        st.subheader("Настройки")
-
-        header_row = st.number_input(
-            "Строка заголовков таблицы",
-            min_value=1,
-            max_value=100,
-            value=DEFAULT_HEADER_ROW,
-            help=(
-                "Если название спецификации в A1, а заголовки таблицы во второй строке, "
-                "оставьте 2. Если заголовки ниже, укажите номер строки вручную."
-            ),
-        )
-
-        ignore_placeholders = st.checkbox(
-            "Игнорировать служебные строки вида '4.'",
-            value=True,
-            help=(
-                "Если в таблице есть пустые служебные строки с текстом '4.' или '5.', "
-                "они не будут участвовать в сравнении."
-            ),
-        )
-
-        output_format = st.selectbox(
-            "Формат результата",
-            ("xlsx", "json"),
-            format_func=lambda x: x.upper(),
-        )
-
-    file_r0 = st.file_uploader("Файл r0 (до корректировки)", type=["xlsx"])
-    file_r1 = st.file_uploader("Файл r1 (после корректировки)", type=["xlsx"])
+    file_r0 = st.file_uploader("Файл r0", type=["xlsx"])
+    file_r1 = st.file_uploader("Файл r1", type=["xlsx"])
 
     if st.button("Сравнить", type="primary"):
         if not file_r0 or not file_r1:
             st.warning("Нужно загрузить оба файла: r0 и r1.")
         else:
             try:
-                old_spec = parse_spec(
-                    file_r0.getvalue(),
-                    file_r0.name,
-                    int(header_row),
-                    ignore_placeholders,
-                )
-                new_spec = parse_spec(
-                    file_r1.getvalue(),
-                    file_r1.name,
-                    int(header_row),
-                    ignore_placeholders,
-                )
+                old_spec = parse_spec(file_r0.getvalue(), file_r0.name)
+                new_spec = parse_spec(file_r1.getvalue(), file_r1.name)
 
-                result = compare_specs(old_spec, new_spec, int(header_row))
+                result = compare_specs(old_spec, new_spec)
+
                 st.session_state.result = result
+                st.session_state.summary = result.summary
+                st.session_state.xlsx_bytes = export_xlsx(result)
 
             except Exception as exc:
                 st.error(f"Ошибка при сравнении: {exc}")
                 st.exception(exc)
 
-    result = st.session_state.get("result")
-
-    if result is None:
-        st.info("Загрузите файлы и нажмите «Сравнить».")
-        return
-
-    if not result.meta.get("headers_equal", True):
-        st.warning("Состав столбцов в файлах различается.")
+    summary = st.session_state.get(
+        "summary",
+        {
+            "added": 0,
+            "deleted": 0,
+            "modified": 0,
+            "unchanged": 0,
+        },
+    )
 
     c1, c2, c3, c4 = st.columns(4)
 
-    c1.metric("Добавлено", result.summary["added"])
-    c2.metric("Удалено", result.summary["deleted"])
-    c3.metric("Изменено", result.summary["modified"])
-    c4.metric("Без изменений", result.summary["unchanged"])
+    c1.metric("Добавлено", summary.get("added", 0))
+    c2.metric("Удалено", summary.get("deleted", 0))
+    c3.metric("Изменено", summary.get("modified", 0))
+    c4.metric("Без изменений", summary.get("unchanged", 0))
 
-    changes_df = changed_fields_to_df(result)
-    added_df = items_to_df(result.added, result.columns, "added")
-    deleted_df = items_to_df(result.deleted, result.columns, "deleted")
+    xlsx_bytes = st.session_state.get("xlsx_bytes")
 
-    tabs = st.tabs(
-        [
-            "Итог",
-            "Изменения",
-            "Добавленные",
-            "Удалённые",
-            "JSON",
-        ]
-    )
+    if xlsx_bytes:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    with tabs[0]:
-        st.subheader("Метаданные")
-        st.json(result.meta)
-
-        st.subheader("Сводка")
-        st.json(result.summary)
-
-    with tabs[1]:
-        st.subheader("Изменённые поля")
-        st.dataframe(changes_df, use_container_width=True)
-
-    with tabs[2]:
-        st.subheader("Добавленные строки")
-        st.dataframe(added_df, use_container_width=True)
-
-    with tabs[3]:
-        st.subheader("Удалённые строки")
-        st.dataframe(deleted_df, use_container_width=True)
-
-    with tabs[4]:
-        st.subheader("Полный JSON-результат")
-        st.json(asdict(result))
-
-    st.subheader("Скачать результат")
-
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-    if output_format == "xlsx":
         st.download_button(
-            "Скачать результат в XLSX",
-            data=export_xlsx(result),
+            "Скачать результат сравнения",
+            data=xlsx_bytes,
             file_name=f"spec_comparison_{timestamp}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_xlsx",
-        )
-    else:
-        st.download_button(
-            "Скачать результат в JSON",
-            data=export_json(result),
-            file_name=f"spec_comparison_{timestamp}.json",
-            mime="application/json",
-            key="download_json",
         )
 
 
