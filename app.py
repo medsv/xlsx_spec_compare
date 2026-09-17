@@ -2,18 +2,19 @@
 # Python >= 3.14
 #
 # Сравнение двух спецификаций Excel.
-# Результат — XLSX с четырьмя листами:
+# Результат — XLSX с листами:
 #   1) Итог
 #   2) Изменения
 #   3) Добавленные
 #   4) Удалённые
-#   5) Спецификация (разметка) — копия r1 с отметками изменений
-#      и вставленными на прежние места удалёнными строками.
+#   5) Спецификация (разметка) — копия листа из r1 с сохранением оформления,
+#      добавленными удалёнными строками из r0 и цветовой разметкой.
 
 import io
 import re
 import unicodedata
 from collections import defaultdict
+from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -67,6 +68,7 @@ class RowRecord:
 class ParsedSpec:
     file_name: str
     title: str
+    header_row: int
     columns: list[str]
     records: list[RowRecord]
 
@@ -230,6 +232,7 @@ def parse_spec(file_bytes: bytes, file_name: str) -> ParsedSpec:
         return ParsedSpec(
             file_name=file_name,
             title=title,
+            header_row=1,
             columns=[],
             records=[],
         )
@@ -243,6 +246,7 @@ def parse_spec(file_bytes: bytes, file_name: str) -> ParsedSpec:
         return ParsedSpec(
             file_name=file_name,
             title=title,
+            header_row=header_excel_row,
             columns=[],
             records=[],
         )
@@ -382,6 +386,7 @@ def parse_spec(file_bytes: bytes, file_name: str) -> ParsedSpec:
     return ParsedSpec(
         file_name=file_name,
         title=title,
+        header_row=header_excel_row,
         columns=columns,
         records=records,
     )
@@ -577,82 +582,56 @@ def df_to_rows(df: pd.DataFrame) -> list[list[Any]]:
     return [[to_cell(v) for v in row] for row in df.astype(object).values.tolist()]
 
 
-def build_marked_spec_view(
-    old: ParsedSpec,
-    new: ParsedSpec,
-    result: ComparisonResult,
-) -> list[tuple[dict[str, str], str, set[str] | None]]:
+def copy_row_style(ws, template_row: int, target_row: int, max_col: int) -> None:
     """
-    Формирует последовательность строк для листа «Спецификация (разметка)».
-
-    Каждая запись — кортеж:
-        (значения строки, статус, набор изменённых полей или None)
-
-    Статусы:
-        - "unchanged" — без изменений
-        - "modified"  — строка из r1, отдельные ячейки подсвечиваются
-        - "added"     — новая строка из r1
-        - "deleted"   — строка, вставленная из r0 на прежнее место
+    Копирует стиль строки-образца в целевую строку.
     """
-    deleted_keys = {item.key for item in result.deleted}
-    added_keys = {item.key for item in result.added}
-    modified_map = {item.key: item for item in result.modified}
+    if template_row < 1 or template_row > ws.max_row:
+        return
 
-    old_keys_set = {rec.key for rec in old.records}
-    new_keys_set = {rec.key for rec in new.records}
-    common_keys_set = old_keys_set & new_keys_set
+    for col in range(1, max_col + 1):
+        src = ws.cell(row=template_row, column=col)
+        dst = ws.cell(row=target_row, column=col)
 
-    # Группируем удалённые строки по «якорю» — ближайшей общей строке,
-    # которая шла в r0 ПОСЛЕ них. Такие удалённые строки будут вставлены
-    # ПЕРЕД этой общей строкой в итоговом листе.
-    deleted_before_anchor: dict[str, list[RowRecord]] = defaultdict(list)
-    pending_deleted: list[RowRecord] = []
+        dst.font = copy(src.font)
+        dst.border = copy(src.border)
+        dst.fill = copy(src.fill)
+        dst.alignment = copy(src.alignment)
+        dst.number_format = src.number_format
+        dst.protection = copy(src.protection)
 
-    for rec in old.records:
-        if rec.key in deleted_keys:
-            pending_deleted.append(rec)
-        elif rec.key in common_keys_set:
-            if pending_deleted:
-                deleted_before_anchor[rec.key] = list(pending_deleted)
-                pending_deleted = []
-
-    merged: list[tuple[dict[str, str], str, set[str] | None]] = []
-
-    for new_rec in new.records:
-        # Сначала вставляем удалённые, которые в r0 шли перед этой строкой.
-        if new_rec.key in deleted_before_anchor:
-            for del_rec in deleted_before_anchor.pop(new_rec.key):
-                merged.append((del_rec.values, "deleted", None))
-
-        if new_rec.key in modified_map:
-            changed_fields = {
-                fc.field for fc in modified_map[new_rec.key].changed_fields
-            }
-            merged.append((new_rec.values, "modified", changed_fields))
-        elif new_rec.key in added_keys:
-            merged.append((new_rec.values, "added", None))
-        else:
-            merged.append((new_rec.values, "unchanged", None))
-
-    # Удалённые, которые в r0 шли после последней общей строки — в конец.
-    for del_rec in pending_deleted:
-        merged.append((del_rec.values, "deleted", None))
-
-    # На случай, если какой-то «якорь» из r0 не встретился в r1 —
-    # добавляем привязанные к нему удалённые строки в конец.
-    for recs in deleted_before_anchor.values():
-        for del_rec in recs:
-            merged.append((del_rec.values, "deleted", None))
-
-    return merged
+    src_dim = ws.row_dimensions.get(template_row)
+    if src_dim is not None and src_dim.height:
+        ws.row_dimensions[target_row].height = src_dim.height
 
 
 def export_xlsx(
     result: ComparisonResult,
     old: ParsedSpec,
     new: ParsedSpec,
+    new_file_bytes: bytes,
 ) -> bytes:
-    wb = Workbook()
+    """
+    Создаёт итоговый файл:
+    - листы с результатами сравнения;
+    - лист-копию спецификации r1 с сохранением исходного оформления;
+    - на этом листе добавляет удалённые строки и раскрашивает изменения.
+    """
+    # Загружаем исходный файл r1, чтобы сохранить оформление первого листа.
+    wb_out = load_workbook(io.BytesIO(new_file_bytes))
+
+    if not wb_out.worksheets:
+        wb_out = Workbook()
+        ws_marked = wb_out.active
+        ws_marked.title = "Спецификация (разметка)"
+    else:
+        ws_marked = wb_out.worksheets[0]
+        ws_marked.title = "Спецификация (разметка)"
+
+        # Оставляем только лист спецификации, остальные листы r1 удаляем.
+        for ws in list(wb_out.worksheets):
+            if ws is not ws_marked:
+                wb_out.remove(ws)
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
@@ -660,6 +639,12 @@ def export_xlsx(
     added_fill = PatternFill("solid", fgColor="C6EFCE")
     deleted_fill = PatternFill("solid", fgColor="FFC7CE")
     modified_fill = PatternFill("solid", fgColor="FFEB9C")
+
+    # Создаём служебные листы перед листом разметки.
+    ws_summary = wb_out.create_sheet("Итог", 0)
+    ws_changes = wb_out.create_sheet("Изменения", 1)
+    ws_added = wb_out.create_sheet("Добавленные", 2)
+    ws_deleted = wb_out.create_sheet("Удалённые", 3)
 
     def write_table(
         ws,
@@ -709,9 +694,6 @@ def export_xlsx(
         ws.freeze_panes = "A2"
 
     # Лист «Итог»
-    ws_summary = wb.active
-    ws_summary.title = "Итог"
-
     summary_rows = [
         ["Файл до корректировки", result.meta.get("old_file", "")],
         ["Файл после корректировки", result.meta.get("new_file", "")],
@@ -732,7 +714,7 @@ def export_xlsx(
     # Лист «Изменения»
     changes_df = changed_fields_to_df(result)
     write_table(
-        wb.create_sheet("Изменения"),
+        ws_changes,
         list(changes_df.columns),
         df_to_rows(changes_df),
         modified_fill,
@@ -741,7 +723,7 @@ def export_xlsx(
     # Лист «Добавленные»
     added_df = items_to_df(result.added, result.columns, "added")
     write_table(
-        wb.create_sheet("Добавленные"),
+        ws_added,
         list(added_df.columns),
         df_to_rows(added_df),
         added_fill,
@@ -750,74 +732,176 @@ def export_xlsx(
     # Лист «Удалённые»
     deleted_df = items_to_df(result.deleted, result.columns, "deleted")
     write_table(
-        wb.create_sheet("Удалённые"),
+        ws_deleted,
         list(deleted_df.columns),
         df_to_rows(deleted_df),
         deleted_fill,
     )
 
-    # Лист «Спецификация (разметка)» — копия r1 с отметками
-    ws_marked = wb.create_sheet("Спецификация (разметка)")
+    # ==========================================================
+    # Разметка листа-копии r1
+    # ==========================================================
 
-    # Строка 1 — название спецификации из r1 (как в оригинале, в A1).
-    ws_marked.cell(row=1, column=1, value=result.meta.get("new_title", ""))
-    ws_marked.cell(row=1, column=1).font = Font(bold=True)
+    marked_columns = new.columns if new.columns else result.columns
+    marked_col_index = {col: i + 1 for i, col in enumerate(marked_columns)}
 
-    # Строка 2 — заголовки столбцов.
-    for col_idx, header in enumerate(result.columns, start=1):
-        cell = ws_marked.cell(row=2, column=col_idx, value=header)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(vertical="top", wrap_text=True)
+    max_col = max(ws_marked.max_column, len(marked_columns))
 
-    # Данные начиная со строки 3.
-    marked_rows = build_marked_spec_view(old, new, result)
+    deleted_keys = {item.key for item in result.deleted}
+    added_keys = {item.key for item in result.added}
+    modified_map = {item.key: item for item in result.modified}
 
-    for row_values, status, changed_fields in marked_rows:
-        row_idx = ws_marked.max_row + 1
+    new_map = {rec.key: rec for rec in new.records}
+    new_row_map = {rec.excel_row: rec for rec in new.records}
 
-        for col_idx, col in enumerate(result.columns, start=1):
-            cell = ws_marked.cell(
-                row=row_idx,
-                column=col_idx,
-                value=to_cell(row_values.get(col, "")),
-            )
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    old_keys_set = {rec.key for rec in old.records}
+    new_keys_set = {rec.key for rec in new.records}
+    common_keys_set = old_keys_set & new_keys_set
 
-            if status == "deleted":
-                cell.fill = deleted_fill
-            elif status == "added":
-                cell.fill = added_fill
-            elif status == "modified" and changed_fields and col in changed_fields:
-                cell.fill = modified_fill
+    # Для каждой удалённой строки ищем в r0 ближайшую общую строку,
+    # которая шла после неё. В r1 удалённая строка будет вставлена
+    # перед этой общей строкой.
+    deleted_by_anchor: dict[int, list[RowRecord]] = defaultdict(list)
+    pending_deleted: list[RowRecord] = []
 
-    # Подбор ширины столбцов на листе разметки.
-    for col_idx, header in enumerate(result.columns, start=1):
-        max_len = len(str(header))
-        max_row = min(ws_marked.max_row, 200)
+    for rec in old.records:
+        if rec.key in deleted_keys:
+            pending_deleted.append(rec)
+        elif rec.key in common_keys_set:
+            if pending_deleted:
+                anchor_rec = new_map.get(rec.key)
+                if anchor_rec:
+                    deleted_by_anchor[anchor_rec.excel_row].extend(pending_deleted)
+                pending_deleted = []
 
-        for row in ws_marked.iter_rows(
-            min_row=2,
-            max_row=max_row,
-            min_col=col_idx,
-            max_col=col_idx,
-        ):
-            for cell in row:
-                if cell.value is not None:
-                    max_len = max(
-                        max_len,
-                        min(len(str(cell.value)), 80),
-                    )
+    end_deleted = pending_deleted
 
-        ws_marked.column_dimensions[get_column_letter(col_idx)].width = min(
-            max_len + 2,
-            80,
+    # Вставляем удалённые строки снизу вверх, чтобы не сбивать номера строк.
+    for anchor_row in sorted(deleted_by_anchor.keys(), reverse=True):
+        recs = deleted_by_anchor[anchor_row]
+        if not recs:
+            continue
+
+        amount = len(recs)
+
+        anchor_rec = new_row_map.get(anchor_row)
+
+        # Если строка-якорь является разделом, обычно лучше брать стиль
+        # из строки выше, а не из самого раздела.
+        use_above_template = bool(
+            anchor_rec
+            and anchor_rec.is_section
+            and (anchor_row - 1) > new.header_row
         )
 
-    ws_marked.freeze_panes = "A3"
+        if anchor_row <= ws_marked.max_row:
+            ws_marked.insert_rows(anchor_row, amount)
+
+            if use_above_template:
+                template_row = anchor_row - 1
+            else:
+                template_row = anchor_row + amount
+
+                if template_row > ws_marked.max_row:
+                    template_row = max(1, anchor_row - 1)
+        else:
+            template_row = max(1, anchor_row - 1)
+
+        for i, rec in enumerate(recs):
+            ins_row = anchor_row + i
+
+            copy_row_style(ws_marked, template_row, ins_row, max_col)
+
+            for col_idx, col in enumerate(marked_columns, start=1):
+                ws_marked.cell(
+                    row=ins_row,
+                    column=col_idx,
+                    value=to_cell(rec.values.get(col, "")),
+                )
+
+            for col_idx in range(1, max_col + 1):
+                ws_marked.cell(row=ins_row, column=col_idx).fill = deleted_fill
+
+    # Вставляем удалённые строки, которые в r0 шли после последней общей строки.
+    if end_deleted:
+        if new.records:
+            last_parsed_row = new.records[-1].excel_row
+        else:
+            last_parsed_row = new.header_row
+
+        total_shift = sum(
+            len(recs)
+            for anchor, recs in deleted_by_anchor.items()
+            if anchor <= last_parsed_row
+        )
+
+        end_start = last_parsed_row + total_shift + 1
+        amount = len(end_deleted)
+
+        if end_start <= ws_marked.max_row:
+            ws_marked.insert_rows(end_start, amount)
+            template_row = max(1, end_start - 1)
+        else:
+            template_row = max(1, end_start - 1)
+
+        for i, rec in enumerate(end_deleted):
+            ins_row = end_start + i
+
+            copy_row_style(ws_marked, template_row, ins_row, max_col)
+
+            for col_idx, col in enumerate(marked_columns, start=1):
+                ws_marked.cell(
+                    row=ins_row,
+                    column=col_idx,
+                    value=to_cell(rec.values.get(col, "")),
+                )
+
+            for col_idx in range(1, max_col + 1):
+                ws_marked.cell(row=ins_row, column=col_idx).fill = deleted_fill
+
+    # После вставки удалённых строк вычисляем итоговые номера строк r1.
+    final_row_by_key: dict[str, int] = {}
+
+    for rec in new.records:
+        shift = sum(
+            len(recs)
+            for anchor, recs in deleted_by_anchor.items()
+            if anchor <= rec.excel_row
+        )
+        final_row_by_key[rec.key] = rec.excel_row + shift
+
+    # Раскрашиваем добавленные строки.
+    for key in added_keys:
+        rec = new_map.get(key)
+        if not rec:
+            continue
+
+        final_row = final_row_by_key.get(rec.key)
+        if not final_row:
+            continue
+
+        for col_idx in range(1, max_col + 1):
+            ws_marked.cell(row=final_row, column=col_idx).fill = added_fill
+
+    # Раскрашиваем только изменённые ячейки.
+    for item in result.modified:
+        rec = new_map.get(item.key)
+        if not rec:
+            continue
+
+        final_row = final_row_by_key.get(rec.key)
+        if not final_row:
+            continue
+
+        for fc in item.changed_fields:
+            col_idx = marked_col_index.get(fc.field)
+            if col_idx:
+                ws_marked.cell(row=final_row, column=col_idx).fill = modified_fill
+
+    wb_out.active = 0
 
     bio = io.BytesIO()
-    wb.save(bio)
+    wb_out.save(bio)
     return bio.getvalue()
 
 
@@ -837,8 +921,11 @@ def main() -> None:
             st.warning("Нужно загрузить оба файла: r0 и r1.")
         else:
             try:
-                old_spec = parse_spec(file_r0.getvalue(), file_r0.name)
-                new_spec = parse_spec(file_r1.getvalue(), file_r1.name)
+                old_bytes = file_r0.getvalue()
+                new_bytes = file_r1.getvalue()
+
+                old_spec = parse_spec(old_bytes, file_r0.name)
+                new_spec = parse_spec(new_bytes, file_r1.name)
 
                 result = compare_specs(old_spec, new_spec)
 
@@ -846,7 +933,12 @@ def main() -> None:
                 st.session_state.old_spec = old_spec
                 st.session_state.new_spec = new_spec
                 st.session_state.summary = result.summary
-                st.session_state.xlsx_bytes = export_xlsx(result, old_spec, new_spec)
+                st.session_state.xlsx_bytes = export_xlsx(
+                    result,
+                    old_spec,
+                    new_spec,
+                    new_bytes,
+                )
 
             except Exception as exc:
                 st.error(f"Ошибка при сравнении: {exc}")
