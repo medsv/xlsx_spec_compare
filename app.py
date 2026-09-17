@@ -2,16 +2,18 @@
 # Python >= 3.14
 #
 # Сравнение двух спецификаций Excel.
-# Минимальный интерфейс:
-# - загрузка r0;
-# - загрузка r1;
-# - кнопка "Сравнить";
-# - метрики;
-# - кнопка скачивания XLSX.
+# Результат — XLSX с четырьмя листами:
+#   1) Итог
+#   2) Изменения
+#   3) Добавленные
+#   4) Удалённые
+#   5) Спецификация (разметка) — копия r1 с отметками изменений
+#      и вставленными на прежние места удалёнными строками.
 
 import io
 import re
 import unicodedata
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -27,33 +29,19 @@ HEADER_SEARCH_LIMIT = 30
 
 PLACEHOLDER_RE = re.compile(r"^\d+[.)]?$")
 
-# Визуально похожие кириллические и латинские буквы.
-# Используется только для нормализации ключей сравнения.
 HOMOGLYPH_MAP = {
-    "А": "A",
-    "а": "a",
-    "В": "B",
-    "в": "b",
-    "Е": "E",
-    "е": "e",
-    "К": "K",
-    "к": "k",
-    "М": "M",
-    "м": "m",
-    "Н": "H",
-    "н": "h",
-    "О": "O",
-    "о": "o",
-    "Р": "P",
-    "р": "p",
-    "С": "C",
-    "с": "c",
-    "Т": "T",
-    "т": "t",
-    "Х": "X",
-    "х": "x",
-    "У": "Y",
-    "у": "y",
+    "А": "A", "а": "a",
+    "В": "B", "в": "b",
+    "Е": "E", "е": "e",
+    "К": "K", "к": "k",
+    "М": "M", "м": "m",
+    "Н": "H", "н": "h",
+    "О": "O", "о": "o",
+    "Р": "P", "р": "p",
+    "С": "C", "с": "c",
+    "Т": "T", "т": "t",
+    "Х": "X", "х": "x",
+    "У": "Y", "у": "y",
 }
 
 HOMOGLYPH_TRANSLATE = {ord(k): v for k, v in HOMOGLYPH_MAP.items()}
@@ -106,9 +94,6 @@ class ComparisonResult:
 
 
 def normalize_text(value: Any) -> str:
-    """
-    Нормализует значение ячейки для отображения и сравнения.
-    """
     if value is None:
         return ""
 
@@ -135,7 +120,6 @@ def normalize_text(value: Any) -> str:
     s = s.replace("\xa0", " ")
     s = re.sub(r"\s+", " ", s).strip()
 
-    # Одиночные прочерки считаем пустым значением.
     if s in {"-", "—", "–", "--", "---"}:
         return ""
 
@@ -143,9 +127,6 @@ def normalize_text(value: Any) -> str:
 
 
 def normalize_for_key(value: Any) -> str:
-    """
-    Нормализует значение для построения ключа сравнения.
-    """
     s = normalize_text(value)
     if not s:
         return ""
@@ -207,9 +188,6 @@ def build_field_map(columns: list[str]) -> dict[str, str | None]:
 
 
 def read_title(file_bytes: bytes) -> str:
-    """
-    Читает название спецификации из ячейки A1.
-    """
     wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
     ws = wb.active
     title = ws.cell(row=1, column=1).value if ws is not None else ""
@@ -218,12 +196,8 @@ def read_title(file_bytes: bytes) -> str:
 
 
 def find_header_index(df_raw: pd.DataFrame) -> int:
-    """
-    Автоматически ищет строку заголовков основной таблицы.
-    """
     limit = min(len(df_raw), HEADER_SEARCH_LIMIT)
 
-    # Основной вариант: есть слова "Поз" и "Наименование".
     for i in range(limit):
         row = df_raw.iloc[i]
         texts = [normalize_text(v).lower() for v in row]
@@ -232,7 +206,6 @@ def find_header_index(df_raw: pd.DataFrame) -> int:
         if "поз" in joined and "наименование" in joined:
             return i
 
-    # Резервный вариант: первая строка с достаточным количеством непустых ячеек.
     for i in range(limit):
         row = df_raw.iloc[i]
         non_empty = sum(1 for v in row if normalize_text(v))
@@ -274,7 +247,6 @@ def parse_spec(file_bytes: bytes, file_name: str) -> ParsedSpec:
             records=[],
         )
 
-    # Определяем последний столбец, у которого есть текст заголовка.
     last_header_col = -1
     for i, v in enumerate(header_values):
         if normalize_text(v):
@@ -322,25 +294,20 @@ def parse_spec(file_bytes: bytes, file_name: str) -> ParsedSpec:
 
         non_empty = [col for col, val in values.items() if val]
 
-        # Полностью пустая строка.
         if not non_empty:
             continue
 
-        # Служебные строки вида "4." или "5.".
         if len(non_empty) == 1:
             only_value = values[non_empty[0]]
             if PLACEHOLDER_RE.fullmatch(only_value):
                 continue
 
-        # Если заполнен только столбец "Наименование...", считаем строку разделом.
         is_section = bool(name_col) and len(non_empty) == 1 and non_empty[0] == name_col
 
         if is_section:
             section_name = values[name_col]
             section_key = normalize_for_key(section_name)
 
-            # Если встретился блок типа "ГОСТы" после основной спецификации,
-            # не обрабатываем его как данные спецификации.
             if section_key == "госты":
                 break
 
@@ -363,34 +330,24 @@ def parse_spec(file_bytes: bytes, file_name: str) -> ParsedSpec:
             unit_val = values.get(unit_col, "") if unit_col else ""
             qty_val = values.get(qty_col, "") if qty_col else ""
 
-            # Признаки изделия.
-            # В реальных файлах единица измерения может быть не заполнена,
-            # поэтому достаточно наименования и количества/единицы.
             is_item = bool(name_val and (unit_val or qty_val))
 
             if is_item:
-                # Ключ изделия:
-                # Наименование | Тип | Код | Завод | Ед. изм.
                 item_parts: list[str] = []
 
                 for col in (name_col, type_col, code_col, factory_col, unit_col):
                     if col:
                         item_parts.append(normalize_for_key(values.get(col, "")))
 
-                # Контекст раздела добавляется, чтобы различать одинаковые изделия
-                # в разных разделах спецификации.
                 base_key = (
                     f"item::{current_section_key or 'no_section'}::"
                     + "|".join(item_parts)
                 )
 
             elif poz:
-                # Строки без признаков изделия, но с позицией,
-                # сопоставляем по нормализованной позиции.
                 base_key = f"poz::{normalize_for_key(poz)}"
 
             else:
-                # Резервный вариант для строк без позиции и без признаков изделия.
                 fallback_parts: list[str] = []
 
                 for col, val in values.items():
@@ -620,7 +577,81 @@ def df_to_rows(df: pd.DataFrame) -> list[list[Any]]:
     return [[to_cell(v) for v in row] for row in df.astype(object).values.tolist()]
 
 
-def export_xlsx(result: ComparisonResult) -> bytes:
+def build_marked_spec_view(
+    old: ParsedSpec,
+    new: ParsedSpec,
+    result: ComparisonResult,
+) -> list[tuple[dict[str, str], str, set[str] | None]]:
+    """
+    Формирует последовательность строк для листа «Спецификация (разметка)».
+
+    Каждая запись — кортеж:
+        (значения строки, статус, набор изменённых полей или None)
+
+    Статусы:
+        - "unchanged" — без изменений
+        - "modified"  — строка из r1, отдельные ячейки подсвечиваются
+        - "added"     — новая строка из r1
+        - "deleted"   — строка, вставленная из r0 на прежнее место
+    """
+    deleted_keys = {item.key for item in result.deleted}
+    added_keys = {item.key for item in result.added}
+    modified_map = {item.key: item for item in result.modified}
+
+    old_keys_set = {rec.key for rec in old.records}
+    new_keys_set = {rec.key for rec in new.records}
+    common_keys_set = old_keys_set & new_keys_set
+
+    # Группируем удалённые строки по «якорю» — ближайшей общей строке,
+    # которая шла в r0 ПОСЛЕ них. Такие удалённые строки будут вставлены
+    # ПЕРЕД этой общей строкой в итоговом листе.
+    deleted_before_anchor: dict[str, list[RowRecord]] = defaultdict(list)
+    pending_deleted: list[RowRecord] = []
+
+    for rec in old.records:
+        if rec.key in deleted_keys:
+            pending_deleted.append(rec)
+        elif rec.key in common_keys_set:
+            if pending_deleted:
+                deleted_before_anchor[rec.key] = list(pending_deleted)
+                pending_deleted = []
+
+    merged: list[tuple[dict[str, str], str, set[str] | None]] = []
+
+    for new_rec in new.records:
+        # Сначала вставляем удалённые, которые в r0 шли перед этой строкой.
+        if new_rec.key in deleted_before_anchor:
+            for del_rec in deleted_before_anchor.pop(new_rec.key):
+                merged.append((del_rec.values, "deleted", None))
+
+        if new_rec.key in modified_map:
+            changed_fields = {
+                fc.field for fc in modified_map[new_rec.key].changed_fields
+            }
+            merged.append((new_rec.values, "modified", changed_fields))
+        elif new_rec.key in added_keys:
+            merged.append((new_rec.values, "added", None))
+        else:
+            merged.append((new_rec.values, "unchanged", None))
+
+    # Удалённые, которые в r0 шли после последней общей строки — в конец.
+    for del_rec in pending_deleted:
+        merged.append((del_rec.values, "deleted", None))
+
+    # На случай, если какой-то «якорь» из r0 не встретился в r1 —
+    # добавляем привязанные к нему удалённые строки в конец.
+    for recs in deleted_before_anchor.values():
+        for del_rec in recs:
+            merged.append((del_rec.values, "deleted", None))
+
+    return merged
+
+
+def export_xlsx(
+    result: ComparisonResult,
+    old: ParsedSpec,
+    new: ParsedSpec,
+) -> bytes:
     wb = Workbook()
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
@@ -677,6 +708,7 @@ def export_xlsx(result: ComparisonResult) -> bytes:
 
         ws.freeze_panes = "A2"
 
+    # Лист «Итог»
     ws_summary = wb.active
     ws_summary.title = "Итог"
 
@@ -697,6 +729,7 @@ def export_xlsx(result: ComparisonResult) -> bytes:
 
     write_table(ws_summary, ["Параметр", "Значение"], summary_rows)
 
+    # Лист «Изменения»
     changes_df = changed_fields_to_df(result)
     write_table(
         wb.create_sheet("Изменения"),
@@ -705,6 +738,7 @@ def export_xlsx(result: ComparisonResult) -> bytes:
         modified_fill,
     )
 
+    # Лист «Добавленные»
     added_df = items_to_df(result.added, result.columns, "added")
     write_table(
         wb.create_sheet("Добавленные"),
@@ -713,6 +747,7 @@ def export_xlsx(result: ComparisonResult) -> bytes:
         added_fill,
     )
 
+    # Лист «Удалённые»
     deleted_df = items_to_df(result.deleted, result.columns, "deleted")
     write_table(
         wb.create_sheet("Удалённые"),
@@ -720,6 +755,66 @@ def export_xlsx(result: ComparisonResult) -> bytes:
         df_to_rows(deleted_df),
         deleted_fill,
     )
+
+    # Лист «Спецификация (разметка)» — копия r1 с отметками
+    ws_marked = wb.create_sheet("Спецификация (разметка)")
+
+    # Строка 1 — название спецификации из r1 (как в оригинале, в A1).
+    ws_marked.cell(row=1, column=1, value=result.meta.get("new_title", ""))
+    ws_marked.cell(row=1, column=1).font = Font(bold=True)
+
+    # Строка 2 — заголовки столбцов.
+    for col_idx, header in enumerate(result.columns, start=1):
+        cell = ws_marked.cell(row=2, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    # Данные начиная со строки 3.
+    marked_rows = build_marked_spec_view(old, new, result)
+
+    for row_values, status, changed_fields in marked_rows:
+        row_idx = ws_marked.max_row + 1
+
+        for col_idx, col in enumerate(result.columns, start=1):
+            cell = ws_marked.cell(
+                row=row_idx,
+                column=col_idx,
+                value=to_cell(row_values.get(col, "")),
+            )
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+            if status == "deleted":
+                cell.fill = deleted_fill
+            elif status == "added":
+                cell.fill = added_fill
+            elif status == "modified" and changed_fields and col in changed_fields:
+                cell.fill = modified_fill
+
+    # Подбор ширины столбцов на листе разметки.
+    for col_idx, header in enumerate(result.columns, start=1):
+        max_len = len(str(header))
+        max_row = min(ws_marked.max_row, 200)
+
+        for row in ws_marked.iter_rows(
+            min_row=2,
+            max_row=max_row,
+            min_col=col_idx,
+            max_col=col_idx,
+        ):
+            for cell in row:
+                if cell.value is not None:
+                    max_len = max(
+                        max_len,
+                        min(len(str(cell.value)), 80),
+                    )
+
+        ws_marked.column_dimensions[get_column_letter(col_idx)].width = min(
+            max_len + 2,
+            80,
+        )
+
+    ws_marked.freeze_panes = "A3"
 
     bio = io.BytesIO()
     wb.save(bio)
@@ -748,8 +843,10 @@ def main() -> None:
                 result = compare_specs(old_spec, new_spec)
 
                 st.session_state.result = result
+                st.session_state.old_spec = old_spec
+                st.session_state.new_spec = new_spec
                 st.session_state.summary = result.summary
-                st.session_state.xlsx_bytes = export_xlsx(result)
+                st.session_state.xlsx_bytes = export_xlsx(result, old_spec, new_spec)
 
             except Exception as exc:
                 st.error(f"Ошибка при сравнении: {exc}")
