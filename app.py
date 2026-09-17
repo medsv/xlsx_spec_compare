@@ -908,13 +908,14 @@ def export_xlsx(
 def main() -> None:
     st.set_page_config(
         page_title="Сравнение спецификаций",
-        layout="wide",
+        page_icon="🔍",
+        layout="centered",
     )
 
     st.title("Сравнение спецификаций")
 
-    file_r0 = st.file_uploader("Файл r0", type=["xlsx"])
-    file_r1 = st.file_uploader("Файл r1", type=["xlsx"])
+    file_r0 = st.file_uploader("Файл r0 (предыдущая ревизия)", type=["xlsx"])
+    file_r1 = st.file_uploader("Файл r1 (актуальная редакция)", type=["xlsx"])
 
     if st.button("Сравнить", type="primary"):
         if not file_r0 or not file_r1:
@@ -939,40 +940,50 @@ def main() -> None:
                     new_spec,
                     new_bytes,
                 )
+                summary = st.session_state.get(
+                    "summary",
+                    {
+                        "added": 0,
+                        "deleted": 0,
+                        "modified": 0,
+                        "unchanged": 0,
+                    },
+                )
+
+                c1, c2, c3, c4 = st.columns(4)
+
+                c1.metric("Добавлено", summary.get("added", 0))
+                c2.metric("Удалено", summary.get("deleted", 0))
+                c3.metric("Изменено", summary.get("modified", 0))
+                c4.metric("Без изменений", summary.get("unchanged", 0))
+
+                xlsx_bytes = st.session_state.get("xlsx_bytes")
+                if xlsx_bytes:
+                    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+                    st.download_button(
+                        "Скачать результат сравнения",
+                        data=xlsx_bytes,
+                        file_name=f"spec_comparison_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
 
             except Exception as exc:
                 st.error(f"Ошибка при сравнении: {exc}")
                 st.exception(exc)
 
-    summary = st.session_state.get(
-        "summary",
-        {
-            "added": 0,
-            "deleted": 0,
-            "modified": 0,
-            "unchanged": 0,
-        },
-    )
 
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("Добавлено", summary.get("added", 0))
-    c2.metric("Удалено", summary.get("deleted", 0))
-    c3.metric("Изменено", summary.get("modified", 0))
-    c4.metric("Без изменений", summary.get("unchanged", 0))
-
-    xlsx_bytes = st.session_state.get("xlsx_bytes")
-
-    if xlsx_bytes:
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-        st.download_button(
-            "Скачать результат сравнения",
-            data=xlsx_bytes,
-            file_name=f"spec_comparison_{timestamp}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
+    st.markdown(
+    """
+    <hr>
+    <p style="text-align: left; color: gray;">
+    <small>
+    2026, С.В. Медведев, engpython@yandex.ru
+    </small>
+    </p>
+    """,
+    unsafe_allow_html=True,
+)
 
 if __name__ == "__main__":
     main()
